@@ -266,6 +266,11 @@ class ConfigMesmerX:
         self.methods["txx"]["l_distrib"] = "GEV"
         self.methods["txx"]["lv"] = "AR1_sci"
 
+        # rx1day
+        self.methods["rx1day"] = {}
+        self.methods["rx1day"]["l_distrib"] = "GEV"
+        self.methods["rx1day"]["lv"] = "AR1_sci"
+
         # mrso
         self.methods["mrso"] = {}
         self.methods["mrso"]["l_distrib"] = "gaussian"

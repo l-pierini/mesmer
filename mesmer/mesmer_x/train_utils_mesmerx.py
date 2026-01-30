@@ -13,6 +13,9 @@ import numpy as np
 import scipy as sp
 import xarray as xr
 
+#Added for Rx1day application
+from scipy.stats import truncnorm
+
 _DISCRETE_DISTRIBUTIONS = sp.stats._discrete_distns._distn_names
 _CONTINUOUS_DISTRIBUTIONS = sp.stats._continuous_distns._distn_names
 
@@ -437,14 +440,21 @@ class Expression:
         return self.distrib(**params)
 
 
+
 def probability_integral_transform(
     data,
     target_name,
     expr_start,
     expr_end,
+    expr_start_mix = None,
+    expr_end_mix = None,
     coeffs_start=None,
+    coeffs_start_mix = None,
+    qual_start = None,
+    qual_end = None,
     preds_start=None,
     coeffs_end=None,
+    coeffs_end_mix = None,
     preds_end=None,
 ):
     """
@@ -462,14 +472,22 @@ def probability_integral_transform(
         string describing the starting expression
     expr_end : str
         string describing the starting expression
+    expr_start_mix : str or None
+        string describing the starting expression for the mixture component, if present
+    expr_end_mix : str or None
+        string describing the starting expression for the mixture component, if present
     preds_start : not sure yet what data format will be used at the end.
         Covariants of the starting expression. Default: empty Dataset.
     coeffs_start : xarray dataset
         Coefficients of the starting expression. Default: empty Dataset.
+    coeffs_start_mix : xarray dataset
+        Coefficients of the starting expression for the mixture component. Default: empty Dataset.
     preds_end : not sure yet what data format will be used at the end.
         Covariants of the ending expression. Default: empty Dataset.
     coeffs_end : xarray dataset
         Coefficients of the ending expression. Default: empty Dataset.
+    coeffs_end_mix : xarray dataset
+        Coefficients of the ending expression for the mixture component. Default: empty Dataset.
 
     Returns
     -------
@@ -497,19 +515,55 @@ def probability_integral_transform(
     """
     # preparation of distributions
     expression_start = Expression(expr_start, "start")
+    #mixture part if present
+    if expr_start_mix is not None:
+        expression_start_mix = Expression(expr_start_mix, "start")
+
     expression_end = Expression(expr_end, "end")
+    if expr_end_mix is not None:
+        expression_end_mix = Expression(expr_end_mix, "start")
 
     if coeffs_start is None:
         coeffs_start = xr.Dataset()
-    if coeffs_end is None:
-        coeffs_end = xr.Dataset()
 
+    if coeffs_end is None:
+        flag_gev = False
+        coeffs_end = xr.Dataset()
+    else:
+        flag_gev = True
+
+    #Identify whether rectification is present in the initial data
+    if qual_start is not None and 'rectification' in list(qual_start.data_vars):
+        rect = qual_start.rectification
+        rect_loc = qual_start.rect_loc #loc of truncated normal describing rectified portion
+        rect_std = qual_start.rect_std #std of truncated normal describing rectified portion
+        #if mixture is done instead of rectification i remove the mask for rectification in those points
+        if expr_start_mix is not None: 
+            cond_rect_up = (qual_start.rectification>=0) & (qual_start.rectification_mix<0)
+            rect = xr.where(cond_rect_up, qual_start.rectification_mix, qual_start.rectification)
+    else:
+        rect = -np.inf
+
+    if qual_end is not None and 'rectification' in list(qual_end.data_vars):
+        rect_end = qual_end.rectification
+        rect_loc_end = qual_end.rect_loc
+        rect_std_end = qual_end.rect_std
+
+        if expr_end_mix is not None:
+            cond_rect_up = (qual_end.rectification>=0) & (qual_end.rectification_mix<0)
+            rect_end = xr.where(cond_rect_up, qual_end.rectification_mix, qual_end.rectification)
+    else:
+        rect_end = -np.inf
     # transformation
     out = []
 
     # loop to change with new data structure of MESMER
     for i, item in enumerate(data):
         data_item, scen = item
+
+        #identify values above rectification threshold
+        mask_rect = data_item[target_name] >= rect
+        
         if preds_start is None:
             preds_start_item = xr.Dataset()
         else:
@@ -520,23 +574,214 @@ def probability_integral_transform(
         else:
             preds_end_item = preds_end[i][0]
 
-        print(f"Transforming {target_name}: {scen}", end="\r")
+        print(f"Transforming {target_name}: {scen}")
+        #I generate artificially the datapoints below the rectification threshold
+        
+
+        ###START
 
         # calculation distributions for this scenario
         distrib_start = expression_start.evaluate(
             coeffs_start, preds_start_item, forced_shape=data_item[target_name].dims
         )
+        
 
+        #First I compute the cdf only above rectification threshold
+        #Handling carefully points with CDF too close to 0 or 1
+        cdf_item = distrib_start.cdf(data_item[target_name].where(mask_rect))
+        print('NaN values in CDF at start: ', np.sum(np.isnan(cdf_item)))
+
+        if np.any(np.isnan(distrib_start.cdf(data_item[target_name]))):
+            nan_coords = np.where(np.isnan(distrib_start.cdf(data_item[target_name])))
+            cdf_item = np.where(np.isnan(distrib_start.cdf(data_item[target_name])), 0.5, cdf_item)
+            print('gridpoints with ', len(nan_coords[-1]), ' nan values: ', set(nan_coords[-1]))
+
+        print('One values in CDF start: ', np.sum(cdf_item == 1))
+        print('Values above 1 in CDF at start: ', np.sum(cdf_item > 1))
+        #To avoid explosions in values after transformation, I set thresholds (min probability)
+        cdf_item = np.where(cdf_item == 1, 0.9999, cdf_item)
+        cdf_item = np.where(cdf_item == 0, 1-0.9999, cdf_item)
+        print('NaN values in CDF at start (2nd): ', np.sum(np.isnan(cdf_item)))
+
+        if np.isscalar(rect)==False: #Rectification case
+            thresholds = np.where(np.isinf(rect.values), np.nan, rect.values)
+            lb = 1e-5 * np.ones_like(rect.values)
+            ub = thresholds
+
+            mus = rect_loc.values
+            stds = rect_std.values
+
+            lb_std = (lb - mus)/stds
+            ub_std = (ub - mus)/stds
+            
+
+            distrib_rect = truncnorm(lb_std, ub_std, loc = mus, scale = stds)
+            #The CDF of the truncated norm is 1 in the trheshold by default, so I need to match it with cdf(threshold)
+            rect_cdf_vals = distrib_start.cdf(thresholds) * distrib_rect.cdf(data_item[target_name].values)
+            rect_cdf_item = np.where(np.isnan(cdf_item), rect_cdf_vals, cdf_item)
+
+            cdf_item = rect_cdf_item
+            print('Nan values after rect: ', np.sum(np.isnan(cdf_item)))
+
+
+        if coeffs_start_mix is not None: #mixture case
+            distrib_start_mix = expression_start_mix.evaluate(
+                coeffs_start_mix, preds_start_item, forced_shape=data_item[target_name].dims
+            )
+
+            cdf_item_mix = distrib_start_mix.cdf(data_item[target_name].where(mask_rect)) #TODO: check that mixture case doesnt overlap with rectification
+            #Might get some warning because some points lie outside of the support of the second distribution,
+            #But this would return a CDF of 0 or 1 regardless
+            p0 = coeffs_start_mix.p0
+            p1 = coeffs_start_mix.p1
+
+            #CDF of mixture expression
+            cdf_item_mix2 = (preds_start_item['GMT_t'] * p1 + p0).values * cdf_item + (- preds_start_item['GMT_t'] * p1 + 1 - p0).values * cdf_item_mix
+            #print('Zero values in CDF mix: ', np.sum(cdf_item_mix2 == 0))
+            #print('One values in CDF mix: ', np.sum(cdf_item_mix2 == 1))
+            print('>1 values in CDF mix: ', np.sum(cdf_item_mix2>1), np.nanmax(cdf_item_mix2))
+            cdf_item = np.where(np.isnan(p0.values), cdf_item, cdf_item_mix2) 
+        
+        #checks, can be removed
+        print('Zero values in CDF: ', np.sum(cdf_item == 0))
+        print('One values in CDF: ', np.sum(cdf_item == 1))
+        print('Values above 1 in CDF: ', np.sum(cdf_item > 1))
+        print('NaN values in CDF after Mix: ', np.sum(np.isnan(cdf_item)))
+        print('Values below 0 in CDF: ', np.sum(cdf_item < 0))
+        print('Min, Max: ', np.nanmin(cdf_item), np.nanmax(cdf_item))
+        cdf_item = np.where(cdf_item == 1, 0.9999, cdf_item)
+        cdf_item = np.where(cdf_item == 0, 1-0.9999, cdf_item)
+        if flag_gev:
+            cdf_item = np.where(cdf_item <= 1e-8, 1e-8, cdf_item)
+            
+            #I exclude events rarer than 1 in 2000 years
+            print('Vals_abobe 1-5e-4:', np.sum(cdf_item >1-5e-4))
+            cdf_item = np.where(cdf_item >1-5e-4, 1-5e-4, cdf_item)
+            print('Vals_above 1-5e-4 afterwards:', np.sum(cdf_item >1-5e-4))
+
+
+
+        ###END
         distrib_end = expression_end.evaluate(
             coeffs_end, preds_end_item, forced_shape=data_item[target_name].dims
         )
-
-        # probabilities of the sample on the starting distribution
-        cdf_item = distrib_start.cdf(data_item[target_name])
-
+        
         # corresponding values on the ending distribution
         transf_item = distrib_end.ppf(cdf_item)
+        print('INF values in PPF: ', np.sum(np.isinf(transf_item))/len(transf_item))
+        print('NaN values in PPF: ', np.sum(np.isnan(transf_item))/len(transf_item))
 
+        #if coeffs_end_mix is not None:
+        #Ways to estimate PPF of MIXTURE distribution
+        if False: #(skipped, takes too long)
+            distrib_end_mix = expression_end_mix.evaluate(
+                coeffs_end_mix, preds_end_item, forced_shape=data_item[target_name].dims
+            )
+
+            p0 = coeffs_end_mix.p0
+            p1 = coeffs_end_mix.p1
+            p = (preds_end_item['GMT_t'] * p1 + p0).values
+            
+            #since in the mixture usually p is close to 1 and 1-p close to zero, 
+            #I take as a first guess the sum of the inverses of the individual cdfs
+            xg = p * distrib_end.ppf(cdf_item) + (1-p) * distrib_end_mix.ppf(cdf_item)
+
+            tol = 1e-3
+            max_steps = 200
+
+            for i in range(max_steps):
+                correction = (p * distrib_end.cdf(xg) + (1-p) * distrib_end_mix.cdf(xg)) - cdf_item
+                xg = xg - correction #I correct the initial guess based on the distances between cdf values
+
+                error = np.abs(correction)/np.abs(xg)
+
+                if np.nanmax(error) < tol:
+                    break
+            if np.any(error > 1e-2):
+                print('Final maximum error in the transformed values larger than 1%')
+            
+            print('Final error on ppf of mixture :', np.nanmax(error))
+            transf_item_mix = xg
+
+            transf_item_tot = np.where(np.isnan(transf_item_mix), transf_item, transf_item_mix)
+            transf_item = transf_item_tot
+
+        #alternative faster method to estimate Mixture PPF based on bisection
+        if coeffs_end_mix is not None: 
+            distrib_end_mix = expression_end_mix.evaluate(
+                coeffs_end_mix, preds_end_item, forced_shape=data_item[target_name].dims
+            )
+
+            p0 = coeffs_end_mix.p0
+            p1 = coeffs_end_mix.p1
+            p = (preds_end_item['GMT_t'] * p1 + p0).values
+            
+            xg = p * distrib_end.ppf(cdf_item) + (1-p) * distrib_end_mix.ppf(cdf_item)
+            
+            x_L = np.full_like(p, 0)  # Lower bound
+            x_U = np.full_like(p, 3*np.nanmax(xg))  # Upper bound
+
+            tol = 1e-5  #Note: the cdf is non linear, so even a small difference close to cdf = 1 changes a lot in the ppf...
+            max_iters = 100
+
+            for i in range(max_iters):
+                x_M = (x_L + x_U)/2
+                F_M = p* distrib_end.cdf(x_M) + (1-p) * distrib_end_mix.cdf(x_M)
+
+                mask_lo = F_M < cdf_item
+                x_L[mask_lo] = x_M[mask_lo]
+                x_U[~mask_lo] = x_M[~mask_lo]
+
+                error = np.nanmax(np.abs(F_M - cdf_item))
+
+                if error<tol:
+                    break
+            
+            f_M = p* distrib_end.pdf(x_M) + (1-p) * distrib_end_mix.pdf(x_M)
+            error_fin = np.nanmax(np.abs(F_M - cdf_item)/(np.maximum(1e-6, np.abs(f_M))))
+            print('Final Error on ppf: ', error_fin)
+            #I first get closer by minimizing the CDF difference, then the ppf to make sure that the error in mm is not large
+
+            print('Final error cdf on bisect method: ', error, i)
+            nan_mask = np.isnan(F_M)
+            x_M[nan_mask] = np.nan
+            transf_item_mix = x_M
+
+            transf_item_tot = np.where(np.isnan(transf_item_mix), transf_item, transf_item_mix)
+            transf_item = transf_item_tot
+
+        #making sure there are no negative values after the transformation
+        neg_values = np.nansum(transf_item.flatten() <0)
+        print('Negative values before rect: ', neg_values, neg_values/len(transf_item.flatten()))
+
+        #RECTIFICATION at the end
+        if np.isscalar(rect_end)==False:
+
+            thresholds = np.where(np.isinf(rect_end.values), np.nan, rect_end.values)
+            lb = 1e-5 * np.ones_like(rect_end.values)
+            ub = thresholds
+            
+            mus = rect_loc_end.values
+            stds = rect_std_end.values
+
+            lb_std = (lb - mus)/stds
+            ub_std = (ub - mus)/stds
+                        
+            distrib_rect = truncnorm(lb_std, ub_std, loc = mus, scale = stds)
+            
+            #Main idea: I replace the data that would be negative (non physical) with the values drawn 
+            #from the truncated normal
+            rect_data = distrib_rect.ppf(cdf_item/distrib_end.cdf(thresholds))
+            transf_item = np.where(transf_item < thresholds, rect_data, transf_item)
+
+            neg_values = np.nansum(transf_item.flatten() <0)
+            print('Negative values after rect: ', neg_values, neg_values/len(transf_item.flatten()))
+
+            small_vals_array = np.random.uniform(0, 0.2, size = transf_item.shape)
+            transf_item = np.where(transf_item<0, small_vals_array, transf_item)
+
+            neg_values = np.nansum(transf_item.flatten() <0)
+            print('Negative values end: ', neg_values, neg_values/len(transf_item.flatten()))
         # archiving
         out.append((transf_item, scen))
 
