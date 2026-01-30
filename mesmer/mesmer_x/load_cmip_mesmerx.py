@@ -171,6 +171,7 @@ def find_files_cmip(esm, var, scenario, cfg, prescribed_members=None):
         "fwixd",
         "fwisa",
         "fwils",
+        "rx1day",
     ]:
         # styles for search
         memb_style = {5: "r*i1p1", 6: "r*i1p1f*"}[cfg.gen]
@@ -365,6 +366,7 @@ def load_cmip(targ, esm, scen, cfg, prescribed_members=None):
             "fwixd",
             "fwisa",
             "fwils",
+            "rx1day",
         ]:
             # Not removing anomaly or normalizing soil moisture.
             pass
